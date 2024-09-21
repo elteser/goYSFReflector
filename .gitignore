@@ -23,12 +23,3 @@ go.work.sum
 
 # env file
 .env
-
-# VuePress default temp directory
-docs/.vuepress/.temp
-# VuePress default cache directory
-docs/.vuepress/.cache
-# VuePress default build output directory
-docs/.vuepress/dist
-# VuePress default node modules directory
-node_modules
