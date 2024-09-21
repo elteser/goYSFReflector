@@ -39,7 +39,7 @@ Our goal is to leverage the performance and concurrency capabilities of Go to bu
 The project is currently in active development, with a focus on:
 
 - UDP packet handling and parsing for YSF communication.
-- Basic command structure for login (YSFP) and logout (YSFU) requests.
+- Basic command structure for poll (YSFP), unlink (YSFU), ... requests.
 - Response handling for incoming connections and status requests.
   
 Stay tuned as we continue to develop new features and improve the reflector's functionality.
