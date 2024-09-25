@@ -5,24 +5,43 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
+	"time"
 )
 
 const (
-	bufferSize         = 4096
-	udpPort            = ":42003"        // Port used during registration of the reflector
-	reflectorName      = "YSFPREFLECTOR" // Example reflector name
-	responseLength     = 14              // Length of the response
-	reflectorID        = "26298"         // ID used during registration of the reflector
-	ysfsResponseLength = 42
+	reflectorID          = "26298"    // ID used during registration of the reflector
+	reflectorName        = "DE DF8VX" // Example reflector name
+	reflectorPort        = ":42003"   // Port used during registration of the reflector
+	reflectorDescription = "Testing"  // Port used during registration of the reflector
+	reflectorVersion     = "0.1"
+	bufferSize           = 4096
+	responseLength       = 14 // Length of the response
+	ysfsResponseLength   = 42
+	packetYSFDLength     = 155 // Length of YSFD packet
 )
 
-// Client structure for handling client information
-var clients = make(map[string]*net.UDPAddr)
+// Client structure for handling client versionrmation with a last activity timestamp
+type Client struct {
+	Address      *net.UDPAddr
+	LastActivity time.Time
+}
+
+// Update the clients map to use the new Client structure
+var clients = make(map[string]Client)
+
+var (
+	tx      [7]interface{}            // Tracking ongoing stream state
+	lockTx  sync.Mutex                // Mutex for concurrent access to `tx`
+	idStr   = 1                       // Unique stream ID
+	rxLock  = make(map[int]bool)      // Lock for streams
+	rxLockT = make(map[int]time.Time) // Timeout map for locked streams
+)
 
 // Function to start the UDP server and listen for packets
 func main() {
 	// Resolve UDP address
-	addr, err := net.ResolveUDPAddr("udp", udpPort)
+	addr, err := net.ResolveUDPAddr("udp", reflectorPort)
 	if err != nil {
 		log.Fatalf("Error resolving address: %v", err)
 	}
@@ -34,9 +53,12 @@ func main() {
 	}
 	defer conn.Close()
 
-	log.Printf("Listening for UDP packets on %s\n", udpPort)
+	log.Printf("Listening for UDP packets on %s\n", reflectorPort)
 
 	buffer := make([]byte, bufferSize)
+
+	// Start the goroutine to check for inactive clients
+	go checkInactiveClients(60 * time.Second)
 
 	for {
 		n, addr, err := conn.ReadFromUDP(buffer)
@@ -67,12 +89,13 @@ func handlePacket(packet []byte, addr *net.UDPAddr, conn *net.UDPConn) {
 		handleYSFU(packet, addr)
 	case "YSFD":
 		log.Printf("Handling YSFD command")
-		// handleYSFD(packet, addr, conn)
+		handleYSFD(packet, addr, conn)
 	case "YSFS":
+		log.Printf("Handling YSFS command")
 		handleYSFS(addr, conn)
 	case "YSFV":
 		log.Printf("Handling YSFV command")
-		// handleYSFV(addr)
+		handleYSFV(addr, conn)
 	case "YSFI":
 		log.Printf("Handling YSFI command")
 		// handleYSFI(packet, addr)
@@ -98,14 +121,20 @@ func handleYSFP(packet []byte, addr *net.UDPAddr, conn *net.UDPConn) {
 	log.Printf("Received YSFP poll from callsign: %s, IP: %s", callsign, addr.String())
 
 	// Check if the client is already connected
-	if _, exists := clients[callsign]; exists {
+	if client, exists := clients[callsign]; exists {
+		// Update the last activity timestamp
+		client.LastActivity = time.Now()
+		clients[callsign] = client
 		log.Printf("Client already connected: %s", callsign)
 		sendResponse(addr, conn)
 		return
 	}
 
 	// Add the client if not already connected
-	clients[callsign] = addr
+	clients[callsign] = Client{
+		Address:      addr,
+		LastActivity: time.Now(),
+	}
 	log.Printf("Client added: %s", callsign)
 
 	// Send a response to confirm successful login
@@ -149,32 +178,118 @@ func sendResponse(addr *net.UDPAddr, conn *net.UDPConn) {
 	}
 }
 
-// Function to handle YSFS packets and send the custom 42-byte response
+// Function to handle YSFS packets and send the custom response
 func handleYSFS(addr *net.UDPAddr, conn *net.UDPConn) {
-	log.Printf("Received YSFS packet from %s", addr.String())
+	log.Printf("YSF server status enquiry from %s:%d", addr.IP.String(), addr.Port)
 
-	// Prepare the 42-byte response
-	response := make([]byte, ysfsResponseLength)
+	// Limit the number of clients to 999
+	clientCount := len(clients)
+	if clientCount > 999 {
+		clientCount = 999
+	}
 
-	// First 4 bytes: Signature "YSFS"
-	copy(response[0:], "YSFS")
+	// Prepare the response string according to the protocol
+	// YSFS + Reflector ID (5 bytes) + Reflector Name (16 bytes) + Reflector Description (14 bytes) + Client Count (3 bytes)
+	info := fmt.Sprintf("YSFS%-5s%-16s%-14s%03d", reflectorID, reflectorName, reflectorDescription, clientCount)
 
-	// Next 5 bytes: Software ID
-	copy(response[4:], reflectorID)
-
-	// Next 30 bytes: YSF Server Name, padded with spaces
-	serverName := fmt.Sprintf("%-30s", reflectorName)
-	copy(response[9:], serverName)
-
-	// Last 3 bytes: Connection count (000-999)
-	connectionCount := fmt.Sprintf("%03d", len(clients))
-	copy(response[39:], connectionCount)
-
-	// Send the 42-byte response
-	_, err := conn.WriteToUDP(response, addr)
+	// Send the response back to the client
+	_, err := conn.WriteToUDP([]byte(info), addr)
 	if err != nil {
-		log.Printf("Failed to send YSFS response: %v", err)
+		log.Printf("Failed to send YSFS response to %s:%d: %v", addr.IP.String(), addr.Port, err)
 	} else {
-		log.Printf("Sent YSFS response to %s", addr.String())
+		log.Printf("Sent YSFS response to %s:%d", addr.IP.String(), addr.Port)
+	}
+}
+
+// Function to handle YSFD (Data) packets
+func handleYSFD(packet []byte, addr *net.UDPAddr, conn *net.UDPConn) {
+	if len(packet) != packetYSFDLength {
+		log.Println("Invalid YSFD packet size")
+		return
+	}
+
+	// Extract gateway callsign (bytes 4-14)
+	gateway := strings.TrimSpace(string(packet[4:14]))
+
+	// Extract source callsign (bytes 14-24)
+	src := strings.TrimSpace(string(packet[14:24]))
+
+	// Extract destination callsign (bytes 24-34)
+	dest := strings.TrimSpace(string(packet[24:34]))
+
+	// If no ongoing stream, create a new one
+	if tx[0] == nil {
+		lockTx.Lock()
+		defer lockTx.Unlock()
+
+		// Start a new stream
+		tx[0] = 1 // New stream
+		tx[2] = gateway
+		tx[3] = src
+		tx[4] = dest
+		tx[5] = idStr
+		tx[6] = time.Now()
+
+		log.Printf("New stream started from %s to %s via %s\n", src, dest, gateway)
+		idStr++
+	} else {
+		log.Printf("Ongoing stream already in progress from %s to %s via %s\n", tx[3], tx[4], tx[2])
+	}
+
+	// Route the packet to other clients except the origin
+	routePacket(packet, addr, conn)
+}
+
+// Function to route packet to all clients except the origin
+func routePacket(packet []byte, originAddr *net.UDPAddr, conn *net.UDPConn) {
+	for callsign, client := range clients {
+		// Skip the origin client
+		if client.Address.IP.Equal(originAddr.IP) && client.Address.Port == originAddr.Port {
+			log.Printf("Skipping origin client: %s", callsign)
+			continue
+		}
+
+		// Send packet to other clients
+		_, err := conn.WriteToUDP(packet, client.Address)
+		if err != nil {
+			log.Printf("Failed to send packet to %s (%s): %v", callsign, client.Address.String(), err)
+		} else {
+			log.Printf("Routed packet to %s (%s)", callsign, client.Address.String())
+		}
+	}
+}
+
+// Function to check for inactive clients and remove them
+func checkInactiveClients(timeout time.Duration) {
+	for {
+		time.Sleep(10 * time.Second) // Check every 10 seconds
+
+		// Get the current time
+		now := time.Now()
+
+		for callsign, client := range clients {
+			// If the client has been inactive for longer than the timeout, remove them
+			if now.Sub(client.LastActivity) > timeout {
+				log.Printf("Client %s has been inactive for more than %s. Removing...", callsign, timeout)
+				delete(clients, callsign)
+			}
+		}
+	}
+}
+
+// Function to handle YSFV packets
+func handleYSFV(addr *net.UDPAddr, conn *net.UDPConn) {
+	// Decode the command and log it
+	log.Printf("Received command YSFV from: %s:%d", addr.IP.String(), addr.Port)
+
+	// Prepare the response: "YSFV" + "pYSFReflector" + " <version>"
+	info := "YSFV" + "goYSFReflector" + " " + reflectorVersion
+
+	// Send the response back to the client
+	_, err := conn.WriteToUDP([]byte(info), addr)
+	if err != nil {
+		log.Printf("Failed to send YSFV response to %s:%d: %v", addr.IP.String(), addr.Port, err)
+	} else {
+		log.Printf("Sent YSFV response to %s:%d", addr.IP.String(), addr.Port)
 	}
 }
